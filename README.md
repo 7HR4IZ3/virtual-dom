@@ -1,4 +1,4 @@
-# virtual Dom
+# Virtual Dom
 Extension of jyserver supporting proxying javascript and python objects between serverand client browser (unstable)
 
 # Quick Demo
