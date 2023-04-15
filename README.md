@@ -26,6 +26,18 @@ app.route("/__process_svr0", callback=dom.websocket)
 class HomePage(Page):
     def on_client_connected(self, *args):
         self.browser.alert('Hello World')
+    
+    def count(self):
+        c = self.browser.document.querySelector('#count')
+        c.innerText = int(c.innerText) + 1
+    
+    def render(self):
+        return h.html(
+            h.body(
+                h.div("Count: ", h.p(id="count")),
+                h.button("Increment", onclick=self.count)
+            )
+        )
 
 @app.route("/")
 def index():
