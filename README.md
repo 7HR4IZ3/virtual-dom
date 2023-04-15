@@ -47,4 +47,4 @@ def index():
 app.run(host=HOST, port=PORT, reloader=True, server=GeventWebSocketServer)
 ```
 
-Check out [the repo] (https://github.com/7HR4IZ3/virtual-dom-demo) for a chat application using virtual dom.
+Check out https://github.com/7HR4IZ3/virtual-dom-demo for a chat application using virtual dom.
