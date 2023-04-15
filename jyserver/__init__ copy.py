@@ -45,7 +45,7 @@ from inspect import signature
 from types import *
 from functools import cached_property
 
-import sys
+import ctypes
 import traceback
 
 import json
@@ -59,30 +59,8 @@ import uuid
 
 from . import jscript
 from ..html import NodeList
-from ..jsbuilder import *
-from ..jsbuilder import _Scope, _to_str
 
 UNDEFINED = object()
-
-
-def load_module(target, **namespace):
-    """ Import a module or fetch an object from a module.
-
-        * ``package.module`` returns `module` as a module object.
-        * ``pack.mod:name`` returns the module variable `name` from `pack.mod`.
-        * ``pack.mod:func()`` calls `pack.mod.func()` and returns the result.
-
-        The last form accepts not only function calls, but any type of
-        expression. Keyword arguments passed to this function are available as
-        local variables. Example: ``load_module('re:compile(x)', x='[a-z]')``
-    """
-    module, target = target.split(":", 1) if ':' in target else (target, None)
-    if module not in sys.modules: __import__(module)
-    if not target: return sys.modules[module]
-    if target.isalnum(): return getattr(sys.modules[module], target)
-    package_name = module.split('.')[0]
-    namespace[package_name] = sys.modules[package_name]
-    return eval('%s.%s' % (module, target), namespace)
 
 def makelist(data):  # This is just too handy
     if isinstance(data, (tuple, list, set, dict)):
@@ -101,7 +79,7 @@ def generateEncoder(state):
             if isinstance(obj, JsObject):
                 return obj.code
             if callable(obj):
-                return "server.%s"%obj.__name__
+                return "erver.%s"%obj.__name__
             # Let the base class default method raise the TypeError
             return super().default(self, obj)
     return JSONEncoder
@@ -110,7 +88,7 @@ def generateDecoder(state):
     class JSONDecoder(json.JSONDecoder):
         def __init__(self, *a, **kw):
             super().__init__(object_hook=self.object_hook, *a, **kw)
-
+        
         def object_hook(self, item: dict):
             for key, val in item.items():
                 if isinstance(val, list):
@@ -143,7 +121,7 @@ def generate_jsClass(proxy):
 class JsClass(object):
     def __init__(self, *a, **kw):
         self.__object = self.proxy.new(*a, **kw)
-
+    
     def __getattr__(self, name):
         return self.__object.__getattr__(name)
 
@@ -173,7 +151,7 @@ class JsProxy:
         if self.__data__["obj_type"] == "function":
             return generate_jsClass(self)
         raise TypeError("JsProxy object is not a class.")
-
+    
     def __call__(self, *a, **kw):
         return self.__state__.obj.browser.client.callProxy(self.__data__['key'], *a, **kw).eval()
 
@@ -240,26 +218,17 @@ class ClientContext:
         self.singleThread = False
         self.socket = None
         self.dom = None
-
-        self.allowed_builtins = None
-        self.allowed_imports = None
-
-        self.disallowed_builtins = []
-        self.disallowed_imports = []
-
         self.socket = socket
         self.command_tasks = tasks or {}
         self.signals = {}
 
         self.command_tasks["state"] = lambda req: ""
-        self.command_tasks["run"] = lambda req: self.run(req['function'], req['args'], req)
-        self.command_tasks["get"] = lambda req: self.get(req['expression'],req)
+        self.command_tasks["run"] = lambda req: self.run(req['function'], req['args'])
+        self.command_tasks["get"] = lambda req: self.get(req['expression'])
         self.command_tasks["set"] = lambda req: bool(self.set(req['property'], req['value']))
-        self.command_tasks["async"] = lambda req: self.run(req['function'], req['args'], req, block=False)
+        self.command_tasks["async"] = lambda req: self.run(req['function'], req['args'], block=False)
         self.command_tasks["next"] = lambda req: self.getNextTask()
         self.command_tasks["unload"] = lambda req: self.addEndTask() or ""
-
-        self.command_tasks["exec_python"] = lambda req: exec(req.code, self.obj.__dict__)
 
         self.command_tasks["error"] = self.setError
         self.command_tasks["get_type"] = self.handle_get_type
@@ -270,12 +239,8 @@ class ClientContext:
         self.command_tasks["get_proxy_attributes"] = self.get_proxy_attributes
         self.command_tasks["has_proxy_attribute"] = self.has_proxy_attribute
         self.command_tasks["delete_proxy_attribute"] = self.delete_proxy_attribute
-        self.command_tasks["delete_proxy"] = self.delete_proxy
         self.command_tasks["call_proxy"] = self.call_proxy
         self.command_tasks["signal"] = self.handle_signal
-
-        self.command_tasks["import"] = self.handle_import
-        self.command_tasks["builtin"] = self.handle_builtin
 
     def __getattr__(self, name):
         if name in self.signals:
@@ -320,7 +285,7 @@ class ClientContext:
         self.trigger(target, *req["args"])
         user_func = getattr(self.obj, "on_client_"+target, None)
         if user_func:
-            user_func(*req["args"])
+            user_func(req["args"])
         return None
 
     def render(self, html):
@@ -414,21 +379,12 @@ class ClientContext:
     
     def setSocket(self, socket):
         self.socket = socket
-
-    def setSocketIo(self, socket):
-        self.socketio = socket
     
     def setDom(self, document):
         self.dom = document
 
     def setError(self, req):
         self._error = RuntimeError(req['error'] + ": " + req["expr"])
-    
-    def toJson(self, req, data, *a, **kw):
-        if req:
-            if req.get("message_id"):
-                data["message_id"] = req["message_id"]
-        return json.dumps(data, *a, cls=self.encoder, **kw)
 
     def processCommand(self, req):
         '''
@@ -497,216 +453,137 @@ class ClientContext:
     def handle_get_type(self, req):
         target = getattr(self.obj, req["function"], None)
         if target:
-            return self.toJson(req, {"value": str(type(target).__name__)})
-        return self.toJson(req, {"value": None})
+            return json.dumps({"value": str(type(target).__name__)})
+        return json.dumps({"value": None})
     
     def proxy_object(self, item):
         handle = None
-        t = str(type(item).__name__)
-        if isinstance(item, JsProxy):
-            item = item.__data__["key"]
-            t = "jsproxy"
-        elif not isinstance(item, (int, str, dict, set, tuple, bool, float, NoneType)):
+        if not isinstance(item, (int, str, dict, set, tuple, bool, float)):
             handle = self.register_proxy(item)
             item = None
 
+        t = str(type(item).__name__)
         if t in ["function", "method"]:
             t = "callable_proxy"
 
         try:
-            return self.toJson(None, {"type": t, "value": item, "location": handle})
+            return json.dumps({"type": t, "value": item, "location": handle}, cls=self.encoder)
         except:
-            return self.toJson(None, {"type": t, "value": str(item), "location": handle})
+            return json.dumps({"type": t, "value": str(item), "location": handle}, cls=self.encoder)
 
     def handle_attribute(self, req):
         target = getattr(self.obj, req["item"], UNDEFINED)
         handle = None
         if not (target is UNDEFINED):
-            t = str(type(target).__name__)
-            if isinstance(target, JsProxy):
-                target = target.__data__["key"]
-                t = "jsproxy"
-            elif not isinstance(target, (int, str, dict, set, tuple, bool, float, NoneType)):
+            if not isinstance(target, (int, str, dict, set, tuple, bool, float)):
                 handle = self.register_proxy(target)
                 target = None
 
+            t = str(type(target).__name__)
             if t in ["function", "method"]:
                 t = "callable_proxy"
             try:
-                return self.toJson(req, {"type": t, "value": target, "location": handle})
+                return json.dumps({"type": t, "value": target, "location": handle}, cls=self.encoder)
             except:
-                return self.toJson(req, {"type": t, "value": str(target), "location": handle})
-        return self.toJson(req, {"type": None, "value": None, "error": True})
-
-    def handle_import(self, req):
-        target = req["item"]
-
-        module = target.split(":")[0] if ":" in target else target
-
-        handle = None
-        if target and (
-            (self.allowed_imports is not None and module in self.allowed_imports) or 
-            (module not in self.disallowed_imports)
-        ):
-            try:
-                target = load_module(target)
-            except Exception as e:
-                return self.toJson(req, {"type": None, "value": None, "error": str(e).replace('"', "'")})
-            t = str(type(target).__name__)
-            if isinstance(target, JsProxy):
-                target = target.__data__["key"]
-                t = "jsproxy"
-            elif not isinstance(target, (int, str, dict, set, tuple, bool, float, NoneType)):
-                handle = self.register_proxy(target)
-                target = None
-
-            if t in ["function", "method"]:
-                t = "callable_proxy"
-            try:
-                return self.toJson(req, {"type": t, "value": target, "location": handle})
-            except:
-                return self.toJson(req, {"type": t, "value": str(target), "location": handle})
-        return self.toJson(req, {"type": None, "value": None, "error": True})
-
-    def handle_builtin(self, req):
-        target = req["item"]
-        handle = None
-        if target and (
-            (self.allowed_builtins is not None and target in self.allowed_builtins) or 
-            (target not in self.disallowed_builtins)
-        ):
-            target = load_module(f"builtins:{target}")
-            t = str(type(target).__name__)
-            if isinstance(target, JsProxy):
-                target = target.__data__["key"]
-                t = "jsproxy"
-            elif not isinstance(target, (int, str, dict, set, tuple, bool, float, NoneType)):
-                handle = self.register_proxy(target)
-                target = None
-
-            if t in ["function", "method", "builtin_function_or_method"]:
-                t = "callable_proxy"
-            try:
-                return self.toJson(req, {"type": t, "value": target, "location": handle})
-            except:
-                return self.toJson(req, {"type": t, "value": str(target), "location": handle})
-        return self.toJson(req, {"type": None, "value": None, "error": True})
+                return json.dumps({"type": t, "value": str(target), "location": handle}, cls=self.encoder)
+        return json.dumps({"type": None, "value": None, "error": True}, cls=self.encoder)
 
     def get_proxy_attributes(self, req):
         target_attr = req.get("target", None)
-        target = self.fxn.get(target_attr)
+        target = self.fxn.get(target_attr) or getattr(self.obj, target_attr, None)
         if target:
-            return self.toJson(req, {"value": dir(target)})
+            return json.dumps({"value": dir(target)}, cls=self.encoder)
 
     def get_proxy_attribute(self, req):
         target_attr = req.get("target", None)
-        target = self.fxn.get(target_attr)
+        target = self.fxn.get(target_attr) or getattr(self.obj, target_attr, None)
         handle = None
         if target:
             attribute = getattr(target, req["prop"], None)
             if attribute:
-                t = str(type(attribute).__name__)
-                if isinstance(attribute, JsProxy):
-                    attribute = attribute.__data__["key"]
-                    t = "jsproxy"
-                elif not isinstance(attribute, (int, str, dict, set, tuple, bool, float, NoneType)):
+                if not isinstance(attribute, (int, str, dict, set, tuple, bool, float)):
                     handle = self.register_proxy(attribute)
                     target = None
 
+                t = str(type(attribute).__name__)
                 if t in ["function", "method"]:
                     t = "callable_proxy"
                 try:
-                    return self.toJson(req, {"type": t, "value": attribute, "location": handle})
+                    return json.dumps({"type": t, "value": attribute, "location": handle}, cls=self.encoder)
                 except:
-                    return self.toJson(req, {"type": t, "value": str(attribute), "location": handle})
-        return self.toJson(req, {"type": None, "value": None, "error": True})
+                    return json.dumps({"type": t, "value": str(attribute), "location": handle}, cls=self.encoder)
+        return json.dumps({"type": None, "value": None, "error": True}, cls=self.encoder)
 
 
     def set_proxy_attribute(self, req):
         target_attr = req.get("target", None)
-        target = self.fxn.get(target_attr)
+        target = self.fxn.get(target_attr) or getattr(self.obj, target_attr, None)
         if target:
             try:
                 setattr(target, req["prop"], req["value"])
-                return self.toJson(req, {"value": True})
+                return json.dumps({"value": True}, cls=self.encoder)
             except Exception as e:
-                return self.toJson(req, {"type": None, "value": None, "error": str(e).replace('"', "'")})
-        return self.toJson(req, {"value": False})
+                return json.dumps({"type": None, "value": None, "error": str(e).replace('"', "'")}, cls=self.encoder)
+        return json.dumps({"value": False}, cls=self.encoder)
 
     def delete_proxy_attribute(self, req):
         target_attr = req.get("target", None)
-        target = self.fxn.get(target_attr)
+        target = self.fxn.get(target_attr) or getattr(self.obj, target_attr, None)
         if target:
             try:
                 value = delattr(target, req["prop"])
-                return self.toJson(req, {"value": value})
+                return json.dumps({"value": value}, cls=self.encoder)
             except Exception as e:
-                return self.toJson(req, {"type": None, "value": None, "error": str(e).replace('"', "'")})
-        return self.toJson(req, {"type": None, "value": None, "error": True})
+                return json.dumps({"type": None, "value": None, "error": str(e).replace('"', "'")}, cls=self.encoder)
+        return json.dumps({"type": None, "value": None, "error": True}, cls=self.encoder)
 
     def has_proxy_attribute(self, req):
         target_attr = req.get("target", None)
-        target = self.fxn.get(target_attr)
+        target = self.fxn.get(target_attr) or getattr(self.obj, target_attr, None)
         if target:
             try:
                 value = hasattr(target, req["prop"])
-                return self.toJson(req, {"value": value})
+                return json.dumps({"value": value}, cls=self.encoder)
             except Exception as e:
-                return self.toJson(req, {"type": None, "value": None, "error": str(e).replace('"', "'")})
-        return self.toJson(req, {"type": None, "value": None, "error": True})
+                return json.dumps({"type": None, "value": None, "error": str(e).replace('"', "'")}, cls=self.encoder)
+        return json.dumps({"type": None, "value": None, "error": True}, cls=self.encoder)
 
     def call_proxy(self, req):
         target_attr = req.get("target", None)
-        target = self.fxn.get(target_attr)
-        print(req, target, self.fxn)
+        target = self.fxn.get(target_attr) or getattr(self.obj, target_attr, None)
         handle = None
         if target:
             try:
                 # print(req)
-                attribute = target(*req.get("args", []), **req.get("kwargs", {}))
+                attribute = target(*req.get("args", []))
                 if attribute:
-                    t = str(type(attribute).__name__)
-                    if isinstance(attribute, JsProxy):
-                        attribute = attribute.__data__["key"]
-                        t = "jsproxy"
-                    elif not isinstance(attribute, (int, str, dict, set, tuple, bool, float, NoneType)):
+                    if not isinstance(attribute, (int, str, dict, set, tuple, bool, float)):
                         handle = self.register_proxy(attribute)
                         target = None
 
+                    t = str(type(attribute).__name__)
                     if t in ["function", "method"]:
                         t = "callable_proxy"
                     try:
-                        return self.toJson(req, {"type": t, "value": attribute, "location": handle})
+                        return json.dumps({"type": t, "value": attribute, "location": handle}, cls=self.encoder)
                     except:
-                        return self.toJson(req, {"type": t, "value": str(attribute), "location": handle})
-                return self.toJson(req, {"error": False, "value": None})
+                        return json.dumps({"type": t, "value": str(attribute), "location": handle}, cls=self.encoder)
+                return json.dumps({"error": False, "value": None}, cls=self.encoder)
             except Exception as e:
-                raise e
-                return self.toJson(req, {"type": None, "value": None, "error": str(e).replace('"', "'")})
-        return self.toJson(req, {"type": None, "value": None, "error": "AttributeError: No such proxy"})
-    
-    def delete_proxy(self, req):
-        target_attr = req.get("target", None)
-        if target_attr:
-            try:
-                self.fxn.pop(target_attr, False)
-                return self.toJson(req, {"value": True})
-            except Exception as e:
-                return self.toJson(req, {"type": None, "value": None, "error": str(e).replace('"', "'")})
-        return self.toJson(req, {"type": None, "value": None, "error": True})
+                return json.dumps({"type": None, "value": None, "error": str(e).replace('"', "'")}, cls=self.encoder)
+        return json.dumps({"type": None, "value": None, "error": "AttributeError: No such proxy"}, cls=self.encoder)
 
     def register_proxy(self, target):
-        if target in self.fxn.values():
-            for k, v in self.fxn.items():
-                if target == v:
-                    return k
+        for k, v in self.fxn.items():
+            if target == v:
+                return k
 
         unique_id = id(target)
         self.fxn[unique_id] = target
-        # print(self.fxn, unique_id)
+        print(self.fxn, unique_id)
         return unique_id
 
-    def run(self, function, args, req, block=True):
+    def run(self, function, args, block=True):
         '''
         Called by the framework to execute a method. This function will look for a method
         with the given name. If it is found, it will execute it. If it is not found it
@@ -732,22 +609,22 @@ class ClientContext:
             if f:
                 try:
                     result = f(*args)
-                    ret = self.toJson(req, {"value":JSroot._v(result)})
+                    ret = json.dumps({"value":JSroot._v(result)})
                 except Exception as ex:
                     s = "%s: %s" % (type(ex).__name__, str(ex))
                     if self.verbose: traceback.print_exc()
                     self.log_message("Exception passed to browser: %s", s)
-                    ret = self.toJson(req, {"error":s.replace('"', "'")})
+                    ret = json.dumps({"error":s.replace('"', "'")})
             else:
                 result = "Unsupported: " + function + "(" + str(args) + ")"
-                ret = self.toJson(req, {"error":str(result).replace('"', "'")})
+                ret = json.dumps({"error":str(result).replace('"', "'")})
             self.log_message("RUN RESULT %s", ret)
             return ret
         finally:
             if block:
                 self.lock.release()
 
-    def get(self, expr, req):
+    def get(self, expr):
         '''
         Called by the framework to execute a method. This function will look for a method
         with the given name. If it is found, it will execute it. If it is not found it
@@ -763,9 +640,9 @@ class ClientContext:
                 value = getattr(self.obj, expr)
                 if callable(value):
                     value = "(function(...args) { return handleApp('%s', args) })" % expr 
-                    return self.toJson(req, {"type":"expression", "expression":value})       
+                    return json.dumps({"type":"expression", "expression":value})       
                 else:
-                    return self.toJson(req, {"type":"value", "value":value})
+                    return json.dumps({"type":"value", "value":value})
             return None
         finally:
             self.lock.release()
@@ -985,67 +862,8 @@ class HtmlPage:
         return b"<head><script>" + U + jscript.JSCRIPT + b"</script></head>" + html
 
 class JsObject:
-    def __init__(self, code=None, client=None):
-        self.code = code or ""
-        self.chain = JSchain()
-        if client:
-            self.bind(client)
-
-    def bind(self, client):
-        self.chain._bind(client)
-        return self
-
-    def eval(self, client=None):
-        if client:
-            self.bind(client)
-        self.chain.chain = []
-        self.chain._add(self.code)
-        return self.chain.eval()
-    
-    def __call__(self):
-        return self.eval()
-
-
-class JSFunc(JsObject):
-    def __init__(self, func, py_scope={}, *a, **kw):
-        super().__init__(*a, **kw)
-        self._orig = func
-        self._py_scope = py_scope
-
-        source_code = inspect.getsource(func)
-        code_ast = ast.parse(textwrap.dedent(source_code))
-        self._code = code_ast.body[0].body
-
-    def compile(self):
-        empty_scope = _Scope()
-        initial_code_py = '\n'.join(
-            "%s = %s" % (k, self.chain._formatArg(v)[0])
-            for (k, v) in self._py_scope.items()
-        )
-
-        if initial_code_py:
-            initial_code_ast = ast.parse(textwrap.dedent(initial_code_py))
-            self._initial_code_js = _to_str(
-                initial_code_ast.body, empty_scope) + ";"
-        else:
-            self._initial_code_js = ""
-
-        self.code = self._initial_code_js + _to_str(
-            self._code,
-            _Scope(self._py_scope)
-        )
-        print(self.code)
-    
-    def eval(self, scope=None, client=None):
-        if scope:
-            self._py_scope = scope
-        if client:
-            self.bind(client)
-        self.compile()
-        return super().eval()
-
-    def __str__(self):
-        return self.code
+    def __init__(self, code):
+        self.code = code
 
 class JSchain:
     '''
@@ -1079,13 +897,10 @@ class JSchain:
     ```
     '''
 
-    def __init__(self, state=None):
+    def __init__(self, state):
         self.state: ClientContext = state
         self.chain = []
         self.keep = True
-    
-    def _bind(self, state):
-        self.state = state
 
     def _dup(self):
         '''
@@ -1263,7 +1078,7 @@ class JSchain:
     #         self._add(f'{val}', prepend="")
 
     def _formatArg(self, arg):
-        # arg = JSroot._v(arg)
+        arg = JSroot._v(arg)
 
         ret = []
 
@@ -1271,8 +1086,6 @@ class JSchain:
         # print()
         if isinstance(arg, JsObject):
             ret.append(arg.code)
-        elif isinstance(arg, JSchain):
-            ret.append(arg._statement())
         elif isinstance(arg, JsProxy):
             ret.append(f"client.getProxyObject('{arg.__data__['key']}')")
         elif isinstance(arg, JsClass):
@@ -1303,18 +1116,11 @@ class JSchain:
         elif hasattr(arg, "to_js"):
             [ret.append(x) for x in arg.to_js(self, arg)]
             # ret.append(f'{val}')
-        elif isinstance(arg, NoneType):
-            ret.append("null")
-        # elif isinstance(arg, (FunctionType, MethodType)):
-        #     pass
         else:
             if not isinstance(arg, (int, str, dict, set, tuple, bool, float)):
                 item = self.state.proxy_object(arg)
                 ret.append("client.get_result("+item+")")
             else:
-                # try:
-                #     val = json.dumps(arg)
-                # except:
                 val = repr(arg)
                 ret.append(f'{val}')
         # elif callable(arg):
@@ -1350,8 +1156,8 @@ class JSchain:
     #     `self.js.func(15)`.
     #     '''
     #     # evaluate the arguments
-    #     p1 = [self.toJson(req, JSroot._v(v)) for v in args]
-    #     p2 = [self.toJson(req, JSroot._v(v)) for k, v in kwargs.items()]
+    #     p1 = [json.dumps(JSroot._v(v), cls=self.encoder) for v in args]
+    #     p2 = [json.dumps(JSroot._v(v), cls=self.encoder) for k, v in kwargs.items()]
     #     s = ','.join(p1 + p2)
     #     # create the function call
     #     self._add('('+s+')', prepend="")
@@ -1362,8 +1168,8 @@ class JSchain:
         `self.js.func(15)`.
         '''
         # evaluate the arguments
-        # p1 = [self.toJson(req, JSroot._v(v)) for v in args]
-        # p2 = [self.toJson(req, JSroot._v(v)) for k, v in kwargs.items()]
+        # p1 = [json.dumps(JSroot._v(v), cls=self.encoder) for v in args]
+        # p2 = [json.dumps(JSroot._v(v), cls=self.encoder) for k, v in kwargs.items()]
         all_args = list(args) +  list(kwargs.values())
 
         # print(all_args)
@@ -1435,12 +1241,10 @@ class JSchain:
         if not self.keep: return
         # print("!!!DEL!!!")
         try:
-            if self.state:
-                self.execExpression()
+            self.execExpression()
         except Exception as ex:
-            if self.state:
-                self.state._error = ex
-                self.state.log_error("Uncatchable exception: %s", str(ex))
+            self.state._error = ex
+            self.state.log_error("Uncatchable exception: %s", str(ex))
             raise ex
 
     def execExpression(self):
@@ -1515,55 +1319,30 @@ class JSchain:
 
         try:
             # idx, q = c.addQuery()
-            data = c.toJson(None, stmt)
+            data = json.dumps(stmt, cls=c.encoder)
             cmd = 'client.sendFromBrowserToServer(%s)'%(data)
-            socket = c.socket or c.socketio
-            value = {
-                "msg": None
-            }
+            socket = c.socket
 
             if socket:
-                socket.send(c.toJson(None, {"expression": cmd}))
-            elif c.socketio:
-                socket.emit("message", c.toJson(None, {"expression": cmd}))
-
-                on_msg = socket.handlers["/"].get("message")
-                
-                @socket.on("message")
-                def _(ev, data):
-                    print(data)
-                    value["msg"] = data
-                    socket.on("message")(on_msg)
-
+                socket.send(json.dumps({"expression": cmd}, cls=c.encoder))
             # else:
                 # c.addTask(cmd)
             try:
                 c.log_message("WAITING ON RESULT QUEUE")
 
-                if c.socket:
+                if socket:
                     try:
                         recv  = socket.receive()
                         result = json.loads(recv, cls=c.decoder)
                     except Exception as e:
                         raise e
-                elif c.socketio:
-                    try:
-                        while True:
-                            time.sleep(0.1)
-                            if value["msg"]:
-                                break
-                        result = json.loads(value["msg"], cls=c.decoder)
-                    except Exception as e:
-                        raise e
-                else:
-                    result = {}
+                        result = {}
                 # else:
                 #     result = q.get(timeout=timeout)
                 # print("Result is", result)
                 c.log_message("RESULT QUEUE %s", result)
                 # c.delQuery(idx)
             except Exception as e:
-                raise e
                 raise RuntimeError("Socker Error executing: ", cmd)
             except queue.Empty:
                 c.log_message("TIMEOUT waiting on: %s", stmt)
@@ -1760,7 +1539,7 @@ class JSroot:
         chain = JSchain(self.state)
         chain._add(stmt)
         return chain.eval()
-
+    
     def __call__(self, item=None, name=None):
         def main(item):
             chain = JSchain(self.state)
@@ -1771,12 +1550,9 @@ class JSroot:
             chain.eval()
             return item
         return main(item) if item else main
-
+    
     def js(self, code):
-        return JsObject(code, self.state)
-
-    def Function(self, code):
-        return JsObject("function() {" + code + "}", self.state)
+        return self.eval(code)
 
     def val(self, key, callback):
         self.linkset[key] = callback

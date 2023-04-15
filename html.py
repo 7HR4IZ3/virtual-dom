@@ -2,17 +2,19 @@ import json
 import random
 import time
 
+from pathlib import Path
+
 from domonic.dom import *
 from domonic import *
 from domonic import JSON
 
-from .jyserver import HtmlPage
+from .jyserver import JSchain
 
-with open("./virtual_dom/jyserver/jyserver.js") as f:
+with open(f"{Path(__file__).parent.absolute()}/jyserver/wsserver.js") as f:
     JYSERVER = f.read()
 
 JYSERVER_AFTER = """
-observer.observe(document.documentElement, {attributes: true, childList: true, characterData: true, subtree: true});
+//observer.observe(document.documentElement, {attributes: true, childList: true, characterData: true, subtree: true});
 """
 
 class Browser:
@@ -20,6 +22,7 @@ class Browser:
     console: Console
     alert: function
     JSON: JSON
+    event: Event
 
 
 class Reactive:
@@ -58,6 +61,72 @@ class Reactive:
         if self.initial:
             setattr(owner, self.private_name, self.initial)
 
+class LocalStorage(Reactive):
+    def __init__(self, default=None, *a, type=str, **kw):
+        super().__init__(*a, **kw)
+        self.type = type
+        self.default = default
+
+    def __get__(self, obj, objtype=None):
+        try:
+            browser = getattr(obj, "browser", None)
+            if browser:
+                item = browser.localStorage.getItem(self.public_name).eval()
+                return self.type(item) if item else self.default
+            else:
+                return self.default 
+        except Exception as e:
+            print(e)
+            return self.default
+
+    def __set__(self, obj, value):
+        browser = getattr(obj, "browser", None)
+        if browser:
+            initial = browser.localStorage.getItem(self.public_name)
+            browser.localStorage.setItem(self.public_name, value)
+
+            if initial:
+                self.onchange(obj)(initial, value)
+    
+    def __set_name__(self, owner, name):
+        self.public_name = name
+
+        if self.initial:
+            self.__set__(owner, self.initial)
+
+class SessionStorage(Reactive):
+    def __init__(self, default=None, *a, type=str, **kw):
+        super().__init__(*a, **kw)
+        self.type = type
+        self.default = default
+
+    def __get__(self, obj, objtype=None):
+        try:
+            browser = getattr(obj, "browser", None)
+            if browser:
+                item = browser.sessionStorage.getItem(self.public_name).eval()
+                return self.type(item) if item else self.default
+            else:
+                return self.default
+        except Exception as e:
+            print(e)
+            return self.default
+
+    def __set__(self, obj, value):
+        browser = getattr(obj, "browser", None)
+        if browser:
+            initial = browser.sessionStorage.getItem(self.public_name)
+            browser.sessionStorage.setItem(self.public_name, value)
+
+            if initial:
+                self.onchange(obj)(initial, value)
+    
+    def __set_name__(self, owner, name):
+        self.public_name = name
+
+        if self.initial:
+            self.__set__(owner, self.initial)
+
 def default_apply(element, value):
     element.innerText = f"{value}"
 
@@ -86,12 +155,10 @@ class HTML:
     h6: HTMLHeadingElement
     p: HTMLParagraphElement
 
-    def __init__(self, context):
+    def __init__(self, context=None):
         self.context = context
-        self.context.custom_tasks["update_dom"] = self.handle_dom_update
-        self.context.custom_tasks["get_type"] = self.handle_get_type
-        self.context.custom_tasks["attribute"] = self.handle_attribute
-        self.context.setDom(document)
+        # self.context.custom_tasks["update_dom"] = self.handle_dom_update
+        # self.context.setDom(document)
         self.document: Document = None
         self._main: Element = None
 
@@ -105,21 +172,6 @@ class HTML:
                 target.removeChild(self.document.evaluate(item["xpath"], None, self.document, XPathResult.FIRST_ORDERED_NODE_TYPE)[0])
         except:
             pass
-    
-    def handle_get_type(self, req):
-        target = getattr(self.context.obj, req["function"], None)
-        if target:
-            return json.dumps({"value": str(type(target).__name__)})
-        return json.dumps({"value": None})
-    
-    def handle_attribute(self, req):
-        target = getattr(self.context.obj, req["item"], None)
-        if not (target is None):
-            try:
-                return json.dumps({"type": str(type(target).__name__), "value": target})
-            except:
-                return json.dumps({"type": str(type(target).__name__), "value": str(target)})
-        return json.dumps({"type": None, "value": None})
 
     def make_element(self, mod):
         nodetype = mod.pop("type")
@@ -143,22 +195,26 @@ class HTML:
                 for (key, value) in kw.items():
                     if not isinstance(value, (str, int, float)):
                         temp_name = getattr(value, "__name__", f"temp_func_{random.randint(0, 100000000)}")
-                        if not hasattr(self.context.obj, temp_name):
-                            self.context.obj.__register__(temp_name, value)
-                        value = """server.%s.then(f=>f())"""%temp_name
+
+                        if self.context:
+                            if temp_name == "<lambda>":
+                                temp_name= f"temp_func_{random.randint(0, 100000000)}"
+                            if not hasattr(self.context, temp_name):
+                                self.context.__register__(temp_name, value)
+                        value = """server.%s()"""%temp_name
                     new[key] = value
-                if name == "html":
-                    _page = HtmlPage(html="")
-                    context = self.context
+                # if name == "html":
+                #     _page = HtmlPage(html="")
+                #     context = self.context
 
-                    HtmlPage.pageMap[_page.pageid] = context.uid
-                    HtmlPage.pageActive[_page.pageid] = time.time()
+                #     HtmlPage.pageMap[_page.pageid] = context.uid
+                #     HtmlPage.pageActive[_page.pageid] = time.time()
 
-                    tag = target(script("var UID='{}';\nvar PAGEID='{}';\n".format(context.uid, _page.pageid), JYSERVER), *a, script(JYSERVER_AFTER), **new)
-                    self._main = tag
-                    self.document = tag.ownerDocument
-                else:
-                    tag = target(*a, **new)
+                #     tag = target(script("var UID='{}';\nvar PAGEID='{}';\n".format(context.uid, _page.pageid), JYSERVER), *a, script(JYSERVER_AFTER), **new)
+                #     self._main = tag
+                #     self.document = tag.ownerDocument
+                # else:
+                tag = target(*a, **new)
                 return tag
             return wrapper
         raise AttributeError()

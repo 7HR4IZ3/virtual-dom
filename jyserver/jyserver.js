@@ -3,37 +3,37 @@ This is the Javascript code that gets injected into the HTML
 page.
 
 server            
-  Proxy class for asynchronous execution of commands
-  on the server. This class does not return a value.
+	Proxy class for asynchronous execution of commands
+	on the server. This class does not return a value.
 
 app               
-  Proxy class that for synchronous exection. Will
-  return a value. However, if used while a page
-  update is in progress, it will fail.
+	Proxy class that for synchronous exection. Will
+	return a value. However, if used while a page
+	update is in progress, it will fail.
 
 Other functions used internally:
 
 evalBrowser()    
-  Queries the server for any pending commands. If
-  there are no pending commands, the connection
-  is kept open by the server until a pending
-  command is issued, or a timeout. At the end of
-  the query, the function gets scheduled for execution
-  again. We schedule it instead of calling so we
-  don't overflow the stack.
+	Queries the server for any pending commands. If
+	there are no pending commands, the connection
+	is kept open by the server until a pending
+	command is issued, or a timeout. At the end of
+	the query, the function gets scheduled for execution
+	again. We schedule it instead of calling so we
+	don't overflow the stack.
 
 sendFromBrowserToServer(e, q) 
-  Evaluate expression `e` and then send the results
-  to the server. This is used by the server to
-  resolve Javascript statements.
+	Evaluate expression `e` and then send the results
+	to the server. This is used by the server to
+	resolve Javascript statements.
 
 sendErrorToServer(e)
-  Send a client expcetion to the server for error
-  handling.
+	Send a client expcetion to the server for error
+	handling.
 
 closeBrowserWindow()
-  Called when a page is terminated so server can
-  stop processing it.
+	Called when a page is terminated so server can
+	stop processing it.
 */
 
 if (typeof UID === "undefined") {
@@ -86,11 +86,11 @@ recieve = (message) => {
 
 ws.onmessage = function (ev) {
   let response = ev.data;
+  console.log("response:", response);
   if (response) {
     let is_json = true;
     let result;
 
-    // console.log("response:", response);
 
     try {
       result = JSON.parse(response);
@@ -166,7 +166,7 @@ let formatters = {
   list: (prop, x) => new Array(x.value),
   dict: (prop, x) => x,
   set: (prop, x) => new Set(x.value),
-  "function": (prop, x) => {
+  function: (prop, x) => {
     return function (...args) {
       return send(
         JSON.stringify({
@@ -175,8 +175,8 @@ let formatters = {
           function: prop,
           args: args,
         })
-      )
-    }
+      );
+    };
   },
   method: (prop, x) => {
     return function (...args) {
@@ -187,9 +187,40 @@ let formatters = {
           function: prop,
           args: args,
         })
-      )
-    }
-  }
+      );
+    };
+  },
+  callable_proxy: (prop, x) => {
+    return function (...args) {
+      return new Promise((resolve, reject) => {
+        function get_result(response) {
+          console.log(x, response);
+          if (response.error) {
+            reject(response.error);
+          }
+          let formatter = formatters[response.type];
+          if (response.location) {
+            resolve(PyProxy(response));
+          } else if (formatter) {
+            resolve(formatter(property, response));
+          }
+          reject("No attribute name: " + prop);
+        }
+
+        recieve(
+          JSON.stringify({
+            session: PAGEID,
+            task: "call_proxy",
+            target: x.location,
+            args: args,
+          })
+        ).then((result) => {
+          console.log("Res", result);
+          get_result(JSON.parse(result));
+        });
+      });
+    };
+  },
 };
 
 function closeBrowserWindow() {
@@ -198,33 +229,35 @@ function closeBrowserWindow() {
 var server = new Proxy(
   {},
   {
-    async get(target, property) {
-      var response;
-
-      function get_result(response) {
-        // console.log(response)
-        let formatter = formatters[response.type];
-        if (formatter) {
-          return formatter(property, response);
+    get(target, property) {
+      return new Promise((resolve, reject) => {
+        function get_result(response) {
+          let formatter = formatters[response.type];
+          if (response.location) {
+            return PyProxy(response);
+          } else if (formatter) {
+            return formatter(property, response);
+          }
+        	return undefined;
         }
-        return PyProxy(response.location);
-      }
 
-      await recieve(
-        JSON.stringify({
-          session: PAGEID,
-          task: "attribute",
-          item: property,
-        })
-      ).then((result) => {
-        try {
-          response = JSON.parse(result);
-        } catch (err) {
-          response = result;
-        }
+        recieve(
+          JSON.stringify({
+            session: PAGEID,
+            task: "attribute",
+            item: property,
+          })
+        ).then((result) => {
+          result = get_result(JSON.parse(result));
+		  if (result == undefined) {
+			if (property !== "then") {
+				reject("No attribute name: " + property)
+			}
+		  } else {
+			resolve(result)
+		  }
+        });
       });
-
-      return get_result(response);
     },
   }
 );
@@ -272,57 +305,125 @@ app = new Proxy(
   }
 );
 
-function PyProxy(response) {
-  return new Proxy(
-    {"$$$": response},
+function PyProxy(res) {
+  let proxy = new Proxy(
+    {},
     {
-      async get(target, property) {
-        let response;
-        await recieve(
-          JSON.stringify({
-            session: PAGEID,
-            task: "proxy_attribute",
-            prop: property,
-            target: target.$$$.location
-          })
-        ).then((result) => {
-          try {
-            response = JSON.parse(result);
-          } catch (err) {
-            response = result;
+      get(target, property) {
+        return new Promise((resolve, reject) => {
+          function get_result(response) {
+            if (response.error) {
+              reject(response.error);
+            }
+            let formatter = formatters[response.type];
+            if (response.location) {
+               return PyProxy(response);
+            } else if (formatter) {
+               return formatter(property, response);
+            }
+            return undefined;
           }
+
+          recieve(
+            JSON.stringify({
+              session: PAGEID,
+              task: "get_proxy_attribute",
+              prop: property,
+              target: res.location,
+            })
+          ).then((result) => {
+			result = get_result(JSON.parse(result));
+			if (result == undefined) {
+				if (property !== "then") {
+					reject("No attribute name: " + property)
+				}
+			} else {
+				resolve(result)
+			}
+		  });
         });
-        let formatter = formatters[response.type];
-        if (formatter) {
-          return formatter(response.value);
-        }
-        return PyProxy(response.value); 
       },
-      async set(target, property, value) {
-        let response;
-        await recieve(
-          JSON.stringify({
-            session: PAGEID,
-            task: "set_proxy_attribute",
-            prop: property,
-            target: target.$$$.location,
-            value: value
-          })
-        ).then((result) => {
-          try {
-            response = JSON.parse(result);
-          } catch (err) {
-            response = result;
-          }
+      set(target, property, value) {
+        return new Promise((resolve, reject) => {
+          recieve(
+            JSON.stringify({
+              session: PAGEID,
+              task: "set_proxy_attribute",
+              prop: property,
+              target: res.location,
+              value: value,
+            })
+          ).then((result) => resolve(JSON.parse(result).value));
         });
-        let formatter = formatters[response.type];
-        if (formatter) {
-          return formatter(response.value);
-        }
-        return PyProxy(response.value);
-      }
+      },
+      ownKeys(target) {
+        return new Promise((resolve, reject) => {
+          recieve(
+            JSON.stringify({
+              session: PAGEID,
+              task: "get_proxy_attributes",
+              target: res.location,
+            })
+          ).then((result) => {
+            resolve(Object.keys(JSON.parse(result).value));
+          });
+        });
+      },
+      deleteProperty(target, prop) {
+        // to intercept property deletion
+        return new Promise((resolve, reject) => {
+          recieve(
+            JSON.stringify({
+              session: PAGEID,
+              task: "delete_proxy_attribute",
+              prop: property,
+              target: res.location,
+              value: prop,
+            })
+          ).then((result) => resolve(JSON.parse(result).value));
+        });
+      },
+      has(target, prop) {
+        return new Promise((resolve, reject) => {
+          recieve(
+            JSON.stringify({
+              session: PAGEID,
+              task: "has_proxy_attribute",
+              prop: property,
+              target: res.location,
+              value: prop,
+            })
+          ).then((result) => resolve(JSON.parse(result).value));
+        });
+      },
+      apply(target, thisArg, args) {
+        return new Promise((resolve, reject) => {
+          function get_result(response) {
+            if (response.error) {
+              reject(response.error);
+            }
+            let formatter = formatters[response.type];
+            if (response.location) {
+              resolve(PyProxy(response));
+            } else if (formatter) {
+              resolve(formatter(property, response));
+            }
+            reject("No attribute name: " + property);
+          }
+
+          recieve(
+            JSON.stringify({
+              session: PAGEID,
+              task: "call_proxy",
+              target: res.location,
+              args: args,
+            })
+          ).then((result) => get_result(JSON.parse(result)));
+        });
+      },
     }
-  )
+  );
+  return proxy;
 }
 
 window.addEventListener("beforeunload", () => {
@@ -431,13 +532,13 @@ function ELementToDict(element) {
   if (element?.nodeType === 1) {
     return html2json(element.outerHTML);
   }
-  return {}
+  return {};
 }
 
 function ELementsToList(elements) {
   let ret = [];
   elements.forEach((item) => {
-    ret.push(ELementToDict(item))
-  })
+    ret.push(ELementToDict(item));
+  });
   return ret;
 }
